@@ -1,0 +1,6 @@
+name: astrbot_plugin_logistics_ai
+display_name: LogisticsAI
+desc: 监听 QQ 群消息并异步上传至 LogisticsAI 数据平台
+version: 0.0.1
+author: LogisticsAI
+repo: https://github.com/your-account/astrbot_plugin_logistics_ai

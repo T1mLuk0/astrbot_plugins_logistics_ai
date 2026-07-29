@@ -1,0 +1,50 @@
+{
+  "enabled": {
+    "description": "是否启用 LogisticsAI 消息上传",
+    "type": "bool",
+    "default": true
+  },
+  "api_url": {
+    "description": "LogisticsAI 后端消息接收接口完整地址",
+    "type": "string",
+    "hint": "例如：http://192.168.1.10:5000/api/messages",
+    "default": "http://127.0.0.1:5000/api/messages"
+  },
+  "api_token": {
+    "description": "后端 API 认证令牌；不需要认证时留空",
+    "type": "string",
+    "hint": "使用 Authorization 时可以填写纯 Token，也可以填写 Bearer xxxxx",
+    "default": ""
+  },
+  "token_header": {
+    "description": "认证令牌使用的 HTTP 请求头",
+    "type": "string",
+    "hint": "常用值：Authorization、X-API-Key",
+    "default": "Authorization"
+  },
+  "timeout": {
+    "description": "单次 HTTP 请求的总超时时间，单位为秒",
+    "type": "float",
+    "default": 15.0
+  },
+  "retry_count": {
+    "description": "上传失败后的重试次数，范围为 0 到 10",
+    "type": "int",
+    "default": 3
+  },
+  "retry_interval": {
+    "description": "首次重试的等待时间，后续使用指数退避，单位为秒",
+    "type": "float",
+    "default": 1.0
+  },
+  "verify_ssl": {
+    "description": "使用 HTTPS 时是否验证服务器 SSL 证书",
+    "type": "bool",
+    "default": true
+  },
+  "max_concurrency": {
+    "description": "允许同时执行的最大上传请求数量",
+    "type": "int",
+    "default": 4
+  }
+}
