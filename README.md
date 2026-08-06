@@ -1,134 +1,243 @@
-# astrbot_plugin_logistics_ai
+# AstrBot LogisticsAI Plugin
 
-监听 AstrBot 接收到的 QQ 群消息，并将群、发送者、文本、图片和文件信息异步上传到 LogisticsAI 后端。
+This AstrBot plugin captures QQ group messages for the LogisticsAI platform. It
+uploads the original message first, preserves explicit reply context, and can
+optionally run silent visual extraction through AstrBot's active multimodal
+provider.
 
-## 功能
+The plugin does not send a bot reply to the group. Raw message persistence is
+the primary operation: multimodal analysis starts only after the original
+message has been accepted by the backend, and an analysis failure never
+invalidates the raw upload.
 
-- 监听群消息
-- 忽略机器人自身消息
-- 提取文本内容
-- 提取图片地址
-- 提取文件地址
-- 异步上传消息
-- 上传失败自动重试
-- 支持 Bearer Token 或自定义 API Key 请求头
-- 插件停止时自动释放 HTTP 连接
+## Features
 
-## 目录结构
+- Captures group, sender, text, image, file, role, and receive-time data.
+- Ignores messages sent by the bot itself.
+- Captures AstrBot `Reply` components and the quoted message snapshot.
+- Uploads raw messages asynchronously with retry and exponential backoff.
+- Reuses a shared `aiohttp` connection pool.
+- Supports Bearer tokens and custom API-key headers.
+- Optionally analyzes messages that contain current-message images.
+- Uses AstrBot's active chat provider, such as Xiaomi MiMo, without changing
+  the provider configured in AstrBot.
+- Uploads visual extraction through an independent second-stage endpoint.
+- Does not call the multimodal model for text-only messages.
+- Shuts down background tasks and HTTP sessions cleanly.
 
-```text
-astrbot_plugin_logistics_ai/
-├── __init__.py
-├── main.py
-├── api.py
-├── models.py
-├── exceptions.py
-├── metadata.yaml
-├── _conf_schema.json
-├── requirements.txt
-├── README.md
-├── LICENSE
-└── .gitignore
-```
-
-## 数据流
+## Processing Order
 
 ```text
-QQ 群消息
-    ↓
-AstrBot 平台适配器
-    ↓
-main.py 监听事件
-    ↓
-解析群、用户、文本、图片、文件
-    ↓
-构建标准消息数据
-    ↓
-api.py 异步 POST
-    ↓
-LogisticsAI ASP.NET Core API
-    ↓
-数据库 / OCR / AI / WebHook / WebSocket
+QQ group message
+    -> capture current message and explicit Reply context
+    -> POST the raw message to LogisticsAI
+    -> receive the stored database ID
+    -> if enabled and the current message contains images:
+         call AstrBot's active multimodal provider silently
+         PUT the structured visual result to the analysis endpoint
 ```
 
-## 后端接口
+The backend remains responsible for text-only extraction, historical context
+resolution, business-event matching, database projection, and customer chat.
+The AstrBot-side model performs visual observation only and must not guess
+which existing database row should be updated.
 
-默认地址：
+## Raw Message Endpoint
 
-```text
-POST http://127.0.0.1:5000/api/messages
+The plugin sends the original message to:
+
+```http
+POST /api/messages
+Content-Type: application/json
 ```
 
-请求内容：
+Example payload:
 
 ```json
 {
+  "platform": "qq",
   "groupId": "123456789",
-  "groupName": "物流业务群",
+  "groupName": "Shipping Operations",
   "userId": "987654321",
-  "nickname": "张三",
-  "messageId": "10001",
+  "nickname": "Operator",
+  "senderRole": "member",
+  "messageId": "10002",
   "messageType": "group_message",
-  "content": "今天的货物已经发出",
+  "content": "Price pending, including released bookings.",
   "images": [
-    "https://example.com/image.jpg"
+    "https://example.com/current-message-image.jpg"
   ],
-  "files": [
-    "https://example.com/file.pdf"
-  ],
-  "receiveTime": "2026-07-29T07:31:04.249000+00:00"
+  "files": [],
+  "reply": {
+    "messageId": "10001",
+    "userId": "222333444",
+    "nickname": "Sales",
+    "content": "KMTC NHAVA SHEVA 2605W ETD moved to the 16th.",
+    "images": [],
+    "files": [],
+    "receiveTime": "2026-08-06T01:00:00+00:00"
+  },
+  "receiveTime": "2026-08-06T01:05:00+00:00"
 }
 ```
 
-后端返回任意 `2xx` 状态码即表示上传成功。
+The `reply` property is omitted when the source event does not contain an
+explicit reply. Existing ASP.NET Core DTOs normally ignore the new
+`senderRole` and `reply` properties until backend support is added, so the
+original endpoint contract remains compatible.
 
-## 插件配置
+Any `2xx` response is treated as a successful raw upload. The default analysis
+URL requires the response to include the stored ID in this shape:
 
-在 AstrBot 插件配置页面填写：
-
-- `enabled`：是否启用上传
-- `api_url`：后端完整接口地址
-- `api_token`：认证令牌
-- `token_header`：认证请求头名称
-- `timeout`：请求超时秒数
-- `retry_count`：失败重试次数
-- `retry_interval`：首次重试间隔
-- `verify_ssl`：是否验证 HTTPS 证书
-- `max_concurrency`：最大并发上传数量
-
-## Docker 网络说明
-
-如果 AstrBot 和 LogisticsAI 后端都运行在 Docker 中，不要使用：
-
-```text
-http://127.0.0.1:5000
+```json
+{
+  "data": {
+    "id": 123,
+    "platform": "qq",
+    "messageId": "10002"
+  },
+  "traceId": "optional-trace-id"
+}
 ```
 
-应使用后端容器的服务名称，例如：
+## Multimodal Analysis Endpoint
+
+When multimodal analysis is enabled, the plugin uploads the result to:
+
+```http
+PUT /api/messages/{database_id}/analysis
+Content-Type: application/json
+```
+
+The payload is the JSON object returned by the active AstrBot model, normalized
+with analyzer metadata, the source message ID, and an analysis timestamp. The
+schema can contain:
+
+```text
+sailings
+freightRates
+events
+unmappedFacts
+evidence
+warnings
+requiresBackendContextResolution
+```
+
+An event may describe a schedule delay, price change, pending price, space
+shortage, booking suspension, or another logistics update. Uncertain values
+remain in raw expression fields for backend review instead of being forced into
+an unreliable frontend field.
+
+Keep `multimodal_analysis_enabled` set to `false` until the backend implements
+the analysis endpoint. Raw uploads continue to work while analysis is disabled.
+
+## Configuration
+
+Configure the plugin from the AstrBot plugin settings page.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `enabled` | `true` | Enable raw message uploads. |
+| `api_url` | `http://127.0.0.1:5000/api/messages` | Full raw-message endpoint URL. |
+| `analysis_url_template` | empty | Optional analysis URL template. |
+| `api_token` | empty | Backend authentication token. |
+| `token_header` | `Authorization` | Header that carries the token. |
+| `timeout` | `15.0` | Backend HTTP timeout in seconds. |
+| `retry_count` | `3` | Retry count after a failed HTTP request. |
+| `retry_interval` | `1.0` | Initial retry delay in seconds. |
+| `verify_ssl` | `true` | Verify HTTPS certificates. |
+| `max_concurrency` | `4` | Maximum concurrent backend requests. |
+| `multimodal_analysis_enabled` | `false` | Enable silent analysis for messages with images. |
+| `multimodal_analysis_timeout` | `120.0` | Model request timeout in seconds. |
+| `multimodal_analysis_concurrency` | `1` | Concurrent model requests, from 1 to 4. |
+| `multimodal_analysis_temperature` | `0.1` | Structured extraction temperature. |
+
+`analysis_url_template` supports these placeholders:
+
+```text
+{database_id}
+{platform}
+{message_id}
+```
+
+When the template is empty, the plugin appends
+`/{database_id}/analysis` to `api_url`.
+
+For the deployed website, a typical raw endpoint is:
+
+```text
+https://eshinetong.com/api/messages
+```
+
+## Docker Networking
+
+If AstrBot and the LogisticsAI backend run in different Docker containers,
+`127.0.0.1` points back to the AstrBot container and normally cannot reach the
+backend. Use a shared Docker network and the backend service name, for example:
 
 ```text
 http://logistics-api:8080/api/messages
 ```
 
-如果后端运行在宿主机，可以根据环境使用：
+If AstrBot should use the public reverse proxy, use the HTTPS website endpoint:
 
 ```text
-http://host.docker.internal:5000/api/messages
+https://eshinetong.com/api/messages
 ```
 
-## 安装
+## Installation
 
-将整个插件目录压缩为 ZIP，ZIP 内第一层应为：
+The plugin requires Python 3.10 or later and AstrBot 4.26.7 or a compatible
+version. Install or update the plugin through AstrBot, or place the repository
+under AstrBot's plugin directory.
+
+The top level must contain the plugin files directly:
 
 ```text
-astrbot_plugin_logistics_ai/
+astrbot_plugins_logistics_ai/
+|-- __init__.py
+|-- main.py
+|-- api.py
+|-- analyzer.py
+|-- prompts.py
+|-- models.py
+|-- exceptions.py
+|-- metadata.yaml
+|-- _conf_schema.json
+|-- requirements.txt
+|-- README.md
+|-- LICENSE
+`-- .gitignore
 ```
 
-不要形成以下错误结构：
+Do not create a duplicated nested plugin directory inside the ZIP archive.
 
-```text
-astrbot_plugin_logistics_ai/
-└── astrbot_plugin_logistics_ai/
-    ├── main.py
-    └── metadata.yaml
+## Verification
+
+Before enabling multimodal analysis, send these messages from a test group:
+
+1. A text-only message. Confirm one raw `POST` and no model call.
+2. A reply to an earlier message. Confirm the raw payload contains `reply`.
+3. An image with a short caption. Confirm the raw `POST` completes first.
+4. Enable multimodal analysis only after the backend analysis endpoint exists.
+5. Repeat the image test and confirm one second-stage `PUT` is recorded.
+
+Run the local standard-library tests from the repository parent directory:
+
+```bash
+python -m unittest discover -s astrbot_plugins_logistics_ai/tests -v
 ```
+
+## Failure Isolation
+
+- A raw upload failure stops processing for that message because there is no
+  stored record to attach analysis to.
+- A provider timeout or invalid provider response produces a bounded failed
+  analysis payload.
+- A failed analysis upload is logged and does not remove or alter the raw
+  message that was already stored.
+- The plugin never sends model output back into the QQ group.
+
+## License
+
+See `LICENSE`.

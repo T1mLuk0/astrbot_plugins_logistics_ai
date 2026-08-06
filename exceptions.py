@@ -1,13 +1,16 @@
-"""LogisticsAI API 异常定义。"""
+"""Exceptions raised by the LogisticsAI AstrBot plugin."""
+
 
 class LogisticsAIError(Exception):
-    """LogisticsAI 插件基础异常。"""
+    """Base exception for the LogisticsAI plugin."""
+
 
 class LogisticsAIConfigurationError(LogisticsAIError):
-    """插件配置不正确。"""
+    """Raised when the plugin configuration is invalid."""
+
 
 class LogisticsAIRequestError(LogisticsAIError):
-    """API 请求失败。"""
+    """Raised when a LogisticsAI backend request fails."""
 
     def __init__(
         self,
@@ -19,3 +22,8 @@ class LogisticsAIRequestError(LogisticsAIError):
         super().__init__(message)
         self.status_code = status_code
         self.response_body = response_body
+
+
+class LogisticsAIAnalysisError(LogisticsAIError):
+    """Raised when AstrBot's current multimodal model cannot analyze a message."""
+

@@ -1,3 +1,3 @@
-"""LogisticsAI AstrBot 插件包。"""
+"""LogisticsAI plugin package for AstrBot."""
 
-__all__ = ["api", "exceptions", "main", "models"]
+__all__ = ["analyzer", "api", "exceptions", "main", "models", "prompts"]
