@@ -10,12 +10,6 @@
     "hint": "Example: https://eshinetong.com/api/messages",
     "default": "http://127.0.0.1:5000/api/messages"
   },
-  "analysis_url_template": {
-    "description": "Optional second-stage analysis URL template. Leave empty to use {api_url}/{database_id}/analysis.",
-    "type": "string",
-    "hint": "Supported placeholders: {database_id}, {platform}, {message_id}",
-    "default": ""
-  },
   "api_token": {
     "description": "Backend API token. Leave empty when authentication is not required.",
     "type": "string",
@@ -29,9 +23,14 @@
     "default": "Authorization"
   },
   "timeout": {
-    "description": "Total timeout in seconds for each backend HTTP request.",
+    "description": "Timeout in seconds for the raw-message upload request.",
     "type": "float",
-    "default": 15.0
+    "default": 30.0
+  },
+  "assistant_reply_timeout": {
+    "description": "Timeout in seconds for forwarding an intercepted native reply to the backend update endpoint.",
+    "type": "float",
+    "default": 300.0
   },
   "retry_count": {
     "description": "Number of retries after a failed backend request, from 0 to 10.",
@@ -52,25 +51,5 @@
     "description": "Maximum number of concurrent backend HTTP requests.",
     "type": "int",
     "default": 4
-  },
-  "multimodal_analysis_enabled": {
-    "description": "Silently analyze current-message images with AstrBot's active model. Keep disabled until the backend analysis endpoint is deployed.",
-    "type": "bool",
-    "default": false
-  },
-  "multimodal_analysis_timeout": {
-    "description": "Maximum time in seconds for one AstrBot multimodal model request.",
-    "type": "float",
-    "default": 120.0
-  },
-  "multimodal_analysis_concurrency": {
-    "description": "Maximum number of concurrent multimodal model requests, from 1 to 4.",
-    "type": "int",
-    "default": 1
-  },
-  "multimodal_analysis_temperature": {
-    "description": "Sampling temperature for structured multimodal extraction, from 0.0 to 1.0.",
-    "type": "float",
-    "default": 0.1
   }
 }

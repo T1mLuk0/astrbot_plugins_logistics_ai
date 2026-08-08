@@ -1,4 +1,4 @@
-"""Prompts for silent multimodal extraction in AstrBot."""
+"""Prompts for silent text and multimodal extraction in AstrBot."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ You are a maritime logistics intelligence extraction engine running inside
 AstrBot. Analyze only the current group message, its attached images, and the
 explicitly quoted message snapshot supplied by the plugin.
 
-The source may mix Chinese and English, use abbreviations, omit a year, contain
+The source may be text-only or image-backed, mix Chinese and English, use abbreviations, omit a year, contain
 price pairs such as "2700/2800", and describe later updates such as a delay,
 price increase, space shortage, booking suspension, or pending price update.
 
@@ -21,7 +21,7 @@ voyages, or database identifiers. Preserve uncertain source expressions in
 raw fields and add a warning. A slash-separated price pair must remain in
 priceExpression unless the source explicitly labels the container order.
 
-This is visual observation and extraction, not final database mutation. When
+This is source observation and extraction, not final database mutation. When
 the message updates earlier information, emit an event with targetHints and set
 requiresBackendContextResolution to true. Never guess a backend target ID.
 
@@ -91,9 +91,9 @@ def build_analysis_prompt(message: dict[str, Any]) -> str:
     }
     return (
         "Extract maritime logistics facts and update events from the current "
-        "message and attached images. The explicit reply is context only; "
+        "message, attached images, and any explicit reply snapshot. For a "
+        "text-only message, use the message text as the primary source. The explicit reply is context only; "
         "distinguish quoted facts from changes stated by the current sender.\n\n"
         "MESSAGE SNAPSHOT:\n"
         + json.dumps(prompt_payload, ensure_ascii=False, separators=(",", ":"))
     )
-

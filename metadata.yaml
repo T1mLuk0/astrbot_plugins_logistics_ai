@@ -1,6 +1,6 @@
 name: astrbot_plugin_logistics_ai
 display_name: LogisticsAI
-desc: Collect group logistics intelligence, reply context, and optional multimodal analysis
-version: 0.1.0
+desc: Capture AstrBot messages from QQ official and NapCat, then route native media replies to LogisticsAI
+version: 0.9.0
 author: LogisticsAI
 repo: https://github.com/T1mLuk0/astrbot_plugins_logistics_ai

@@ -7,7 +7,6 @@ import json
 import random
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import quote
 
 import aiohttp
 from astrbot.api import logger
@@ -20,7 +19,7 @@ from .models import LogisticsMessage, UploadReceipt
 
 
 class ApiClient:
-    """Upload raw messages and later multimodal analysis results."""
+    """Upload raw messages; all AI work stays in the backend."""
 
     RETRYABLE_STATUS_CODES = {
         408,
@@ -40,16 +39,18 @@ class ApiClient:
             "api_url",
             "http://127.0.0.1:5000/api/messages",
         )
-        self._analysis_url_template = self._get_string(
-            "analysis_url_template",
-            "",
-        )
         self._api_token = self._get_string("api_token", "")
         self._token_header = self._get_string(
             "token_header",
             "Authorization",
         )
-        self._timeout = self._get_float("timeout", 15.0, minimum=1.0)
+        configured_timeout = self._get_float("timeout", 30.0, minimum=5.0)
+        self._timeout = configured_timeout
+        self._assistant_reply_timeout = self._get_float(
+            "assistant_reply_timeout",
+            300.0,
+            minimum=10.0,
+        )
         self._retry_count = self._get_int(
             "retry_count",
             3,
@@ -68,7 +69,6 @@ class ApiClient:
             minimum=1,
             maximum=100,
         )
-
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(self._max_concurrency)
@@ -101,24 +101,47 @@ class ApiClient:
 
         return self._parse_upload_receipt(response_body, payload)
 
-    async def upload_analysis(
+    async def upload_text_analysis(
         self,
         receipt: UploadReceipt,
-        analysis: dict[str, Any],
+        *,
+        assistant_reply: str,
     ) -> None:
-        """Upload a second-stage multimodal result for a stored message."""
-        if not self._enabled:
+        """Forward a native AstrBot reply to the existing analysis endpoint.
+
+        The backend keeps the original row, replaces its raw content with this
+        native media description, and queues the same row for another analysis
+        pass. The separate request never blocks initial message capture.
+        """
+        if not self._enabled or receipt.database_id is None:
+            return
+
+        normalized_reply = str(assistant_reply or "").strip()
+        if not normalized_reply:
+            logger.warning(
+                "Skipping native assistant reply upload because the reply is empty. "
+                "database_id=%s",
+                receipt.database_id,
+            )
             return
 
         self._ensure_open()
-        analysis_url = self._build_analysis_url(receipt)
-
+        analysis_url = (
+            f"{self._api_url.rstrip('/')}/"
+            f"{receipt.database_id}/text-analysis"
+        )
         async with self._semaphore:
             await self._request_with_retry(
-                method="PUT",
+                method="POST",
                 url=analysis_url,
-                payload=analysis,
+                payload={"assistantReply": normalized_reply},
+                timeout_seconds=self._assistant_reply_timeout,
             )
+
+        logger.info(
+            "Native assistant reply forwarded for backend analysis. database_id=%s",
+            receipt.database_id,
+        )
 
     async def _request_with_retry(
         self,
@@ -126,6 +149,7 @@ class ApiClient:
         method: str,
         url: str,
         payload: dict[str, Any],
+        timeout_seconds: float | None = None,
     ) -> str:
         """Execute an HTTP request with bounded exponential backoff."""
         total_attempts = self._retry_count + 1
@@ -133,7 +157,12 @@ class ApiClient:
 
         for attempt in range(1, total_attempts + 1):
             try:
-                return await self._request(method, url, payload)
+                return await self._request(
+                    method,
+                    url,
+                    payload,
+                    timeout_seconds=timeout_seconds,
+                )
             except asyncio.CancelledError:
                 raise
             except LogisticsAIRequestError as exc:
@@ -170,6 +199,8 @@ class ApiClient:
         method: str,
         url: str,
         payload: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
     ) -> str:
         """Send one JSON request to the LogisticsAI backend."""
         session = await self._get_session()
@@ -180,6 +211,11 @@ class ApiClient:
             json=payload,
             headers=self._build_headers(),
             ssl=self._verify_ssl,
+            timeout=(
+                aiohttp.ClientTimeout(total=timeout_seconds)
+                if timeout_seconds is not None
+                else aiohttp.ClientTimeout(total=self._timeout)
+            ),
         ) as response:
             response_body = await response.text()
             if 200 <= response.status < 300:
@@ -232,28 +268,6 @@ class ApiClient:
             message_id=message_id,
         )
 
-    def _build_analysis_url(self, receipt: UploadReceipt) -> str:
-        """Build the idempotent analysis endpoint URL."""
-        if self._analysis_url_template:
-            try:
-                return self._analysis_url_template.format(
-                    database_id=receipt.database_id or "",
-                    platform=quote(receipt.platform, safe=""),
-                    message_id=quote(receipt.message_id, safe=""),
-                )
-            except (KeyError, ValueError) as exc:
-                raise LogisticsAIConfigurationError(
-                    "analysis_url_template contains an unsupported placeholder."
-                ) from exc
-
-        if receipt.database_id is None:
-            raise LogisticsAIRequestError(
-                "The raw upload response did not include data.id, so the "
-                "default analysis URL cannot be built."
-            )
-
-        return f"{self._api_url.rstrip('/')}/{receipt.database_id}/analysis"
-
     async def _get_session(self) -> aiohttp.ClientSession:
         """Create and reuse one thread-safe HTTP session."""
         self._ensure_open()
@@ -281,7 +295,7 @@ class ApiClient:
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "User-Agent": "AstrBot-LogisticsAI/0.1.0",
+            "User-Agent": "AstrBot-LogisticsAI/0.9.0",
         }
         if not self._api_token:
             return headers
@@ -398,11 +412,10 @@ class ApiClient:
         safe_config = {
             "enabled": self._enabled,
             "api_url": self._api_url,
-            "analysis_url_template": self._analysis_url_template,
             "timeout": self._timeout,
+            "assistant_reply_timeout": self._assistant_reply_timeout,
             "retry_count": self._retry_count,
             "verify_ssl": self._verify_ssl,
             "max_concurrency": self._max_concurrency,
         }
         return f"ApiClient({json.dumps(safe_config, ensure_ascii=True)})"
-

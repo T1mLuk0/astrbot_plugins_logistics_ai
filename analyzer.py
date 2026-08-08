@@ -1,14 +1,18 @@
-"""Silent multimodal analysis using AstrBot's active chat provider."""
+"""Silent text and multimodal analysis using AstrBot's active provider."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import re
+import tempfile
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+import aiohttp
 from astrbot.api import logger
 from astrbot.api.star import Context
 
@@ -17,7 +21,12 @@ from .prompts import ANALYSIS_SYSTEM_PROMPT, build_analysis_prompt
 
 
 class MultimodalAnalyzer:
-    """Analyze image-bearing messages without producing a visible bot reply."""
+    """Analyze logistics messages without producing a visible bot reply.
+
+    ``multimodal_analysis_enabled`` is intentionally reserved for image-aware
+    extraction. Text-only extraction is delegated to the backend DeepSeek
+    provider so AstrBot's single multimodal provider is not overloaded.
+    """
 
     _CODE_FENCE_PATTERN = re.compile(
         r"^\s*```(?:json)?\s*(.*?)\s*```\s*$",
@@ -70,59 +79,160 @@ class MultimodalAnalyzer:
     ) -> dict[str, Any]:
         """Call the active provider and return a normalized analysis object."""
         image_urls = self._normalize_string_list(message.get("images"))
-        if not image_urls:
-            raise LogisticsAIAnalysisError(
-                "Multimodal analysis requires at least one current-message image."
-            )
+        provider_image_urls, temporary_files = await self._prepare_images(
+            image_urls
+        )
 
-        async with self._semaphore:
-            provider_id = await self._context.get_current_chat_provider_id(
-                umo=unified_msg_origin
-            )
-            prompt = build_analysis_prompt(message)
+        try:
+            async with self._semaphore:
+                provider_id = await self._context.get_current_chat_provider_id(
+                    umo=unified_msg_origin
+                )
+                prompt = build_analysis_prompt(message)
+                generate_kwargs: dict[str, Any] = {
+                    "chat_provider_id": provider_id,
+                    "prompt": prompt,
+                    "system_prompt": ANALYSIS_SYSTEM_PROMPT,
+                    "temperature": self._temperature,
+                }
+                if provider_image_urls:
+                    generate_kwargs["image_urls"] = provider_image_urls
+
+                try:
+                    response = await asyncio.wait_for(
+                        self._context.llm_generate(**generate_kwargs),
+                        timeout=self._timeout,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError as exc:
+                    raise LogisticsAIAnalysisError(
+                        f"AI analysis timed out after {self._timeout:.0f} seconds."
+                    ) from exc
+                except Exception as exc:
+                    raise LogisticsAIAnalysisError(
+                        f"AstrBot AI provider request failed: {exc}"
+                    ) from exc
+
+                completion_text = str(
+                    getattr(response, "completion_text", "") or ""
+                ).strip()
+                if not completion_text:
+                    raise LogisticsAIAnalysisError(
+                        "AstrBot AI provider returned an empty response."
+                    )
+
+                analysis = self.extract_json_object(completion_text)
+                self._normalize_analysis(analysis)
+                analysis["analyzer"] = {
+                    "location": "astrbot",
+                    "providerId": provider_id,
+                    "mode": "multimodal_extraction"
+                    if image_urls
+                    else "text_extraction",
+                }
+                analysis["sourceMessageId"] = str(
+                    message.get("messageId") or ""
+                )
+                analysis["analyzedAt"] = datetime.now(timezone.utc).isoformat()
+                return analysis
+        finally:
+            self._cleanup_temporary_files(temporary_files)
+
+    async def _prepare_images(
+        self,
+        image_urls: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Make provider image inputs usable without relying on QQ URL access."""
+        prepared: list[str] = []
+        temporary_files: list[str] = []
+
+        for image_url in image_urls:
+            local_path = self._existing_local_path(image_url)
+            if local_path is not None:
+                prepared.append(local_path)
+                continue
+
+            if not image_url.startswith(("http://", "https://")):
+                prepared.append(image_url)
+                continue
 
             try:
-                response = await asyncio.wait_for(
-                    self._context.llm_generate(
-                        chat_provider_id=provider_id,
-                        prompt=prompt,
-                        image_urls=image_urls,
-                        system_prompt=ANALYSIS_SYSTEM_PROMPT,
-                        temperature=self._temperature,
-                    ),
-                    timeout=self._timeout,
-                )
+                downloaded_path = await self._download_image(image_url)
             except asyncio.CancelledError:
                 raise
-            except asyncio.TimeoutError as exc:
-                raise LogisticsAIAnalysisError(
-                    f"Multimodal analysis timed out after {self._timeout:.0f} seconds."
-                ) from exc
             except Exception as exc:
-                raise LogisticsAIAnalysisError(
-                    f"AstrBot multimodal provider request failed: {exc}"
-                ) from exc
-
-            completion_text = str(
-                getattr(response, "completion_text", "") or ""
-            ).strip()
-            if not completion_text:
-                raise LogisticsAIAnalysisError(
-                    "AstrBot multimodal provider returned an empty response."
+                logger.warning(
+                    "LogisticsAI could not download image for AI analysis; "
+                    "the provider will receive the original URL: %s",
+                    exc,
                 )
+                prepared.append(image_url)
+                continue
 
-            analysis = self.extract_json_object(completion_text)
-            self._normalize_analysis(analysis)
-            analysis["analyzer"] = {
-                "location": "astrbot",
-                "providerId": provider_id,
-                "mode": "visual_extraction",
-            }
-            analysis["sourceMessageId"] = str(
-                message.get("messageId") or ""
-            )
-            analysis["analyzedAt"] = datetime.now(timezone.utc).isoformat()
-            return analysis
+            prepared.append(downloaded_path)
+            temporary_files.append(downloaded_path)
+
+        return prepared, temporary_files
+
+    async def _download_image(self, image_url: str) -> str:
+        """Download one remote image to a temporary local file."""
+        timeout = aiohttp.ClientTimeout(
+            total=min(max(self._timeout, 10.0), 30.0)
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                image_url,
+                allow_redirects=True,
+            ) as response:
+                if response.status < 200 or response.status >= 300:
+                    raise LogisticsAIAnalysisError(
+                        f"image download returned HTTP {response.status}"
+                    )
+
+                content = await response.read()
+                if not content:
+                    raise LogisticsAIAnalysisError(
+                        "image download returned an empty body"
+                    )
+                if len(content) > 15 * 1024 * 1024:
+                    raise LogisticsAIAnalysisError(
+                        "image download exceeded the 15 MiB limit"
+                    )
+
+                content_type = response.headers.get("Content-Type", "")
+                suffix = mimetypes.guess_extension(
+                    content_type.split(";", 1)[0].strip()
+                ) or Path(image_url).suffix[:8]
+                suffix = suffix if suffix and len(suffix) <= 8 else ".img"
+
+                with tempfile.NamedTemporaryFile(
+                    prefix="logistics-ai-image-",
+                    suffix=suffix,
+                    delete=False,
+                ) as temporary_file:
+                    temporary_file.write(content)
+                    return temporary_file.name
+
+    @staticmethod
+    def _existing_local_path(value: str) -> str | None:
+        try:
+            path = Path(value).expanduser()
+            return str(path.resolve()) if path.is_file() else None
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _cleanup_temporary_files(paths: list[str]) -> None:
+        for path in paths:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                logger.debug(
+                    "LogisticsAI could not remove temporary image file: %s",
+                    path,
+                    exc_info=True,
+                )
 
     @classmethod
     def extract_json_object(cls, value: str) -> dict[str, Any]:
@@ -167,7 +277,7 @@ class MultimodalAnalyzer:
             "schemaVersion": "1.0",
             "status": "failed",
             "documentType": "unknown",
-            "summary": "AstrBot multimodal analysis failed.",
+            "summary": "AstrBot AI analysis failed.",
             "extractedText": "",
             "sailings": [],
             "freightRates": [],
@@ -275,4 +385,3 @@ class MultimodalAnalyzer:
             number = default
         number = max(minimum, number)
         return min(number, maximum) if maximum is not None else number
-
